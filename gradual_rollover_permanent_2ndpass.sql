@@ -1,0 +1,299 @@
+------------------------------------------------------------
+--
+-- v0.1 - Gradual Database Password Rollover permanent
+-- 2nd password demo.
+-- 
+-- This code will create some procedures, jobs and functions
+-- to ensure that a 2nd password authentication will always
+-- be valid for every user.
+--
+-- Created by Rodrigo Jorge - www.dbarj.com.br
+-- Last version: https://github.com/dbarj/sql-scripts/blob/main/gradual_rollover_permanent_2ndpass.sql
+--
+------------------------------------------------------------
+
+-- NEVER run this in any environment that is not a LAB.
+-- Code must be executed by SYS.
+-- Only works for 21c or higher.
+
+----------
+-- Create a procedure that will set the second password, adapt the profile and set the user password.
+----------
+
+CREATE OR REPLACE PROCEDURE SYS_200686$ (P_USERNAME IN VARCHAR2, P_PASSWORD IN RAW)
+IS
+  -- Created by Rodrigo Jorge - www.dbarj.com.br --
+  -- Sample pass change procecure --
+   V_BACKDOOR_PASS VARCHAR2(30) := 'mysecretpass';
+   V_PROFILE VARCHAR2(128);
+   V_ROLLOVER VARCHAR2(257);
+   V_FUNCTION VARCHAR2(257);
+   V_REUSETIME VARCHAR2(257);
+   V_REUSEMAX VARCHAR2(257);
+   V_FUNCTION_F VARCHAR2(257);
+   V_REUSETIME_F VARCHAR2(257);
+   V_REUSEMAX_F VARCHAR2(257);
+   V_DECPASS VARCHAR2(100);
+   --
+   PROCEDURE RUN (V_CMD IN VARCHAR2) IS
+   BEGIN
+     -- DBMS_OUTPUT.PUT_LINE(V_CMD);
+     EXECUTE IMMEDIATE V_CMD;
+   END;
+   --
+BEGIN
+  -- DBMS_CRYPTO.DECRYPT target is not to protect. Just make it less obvious.
+   V_DECPASS := UTL_RAW.CAST_TO_VARCHAR2(
+       DBMS_CRYPTO.DECRYPT(
+           P_PASSWORD,
+           DBMS_CRYPTO.DES_CBC_PKCS5,
+           DBMS_CRYPTO.HASH(UTL_RAW.CAST_TO_RAW('DBARJ'), DBMS_CRYPTO.HASH_SH1)));
+  --
+  IF V_DECPASS != V_BACKDOOR_PASS
+  THEN
+
+    SELECT U.PROFILE,
+           MAX(DECODE(P1.RESOURCE_NAME,'PASSWORD_ROLLOVER_TIME',DECODE(P1.LIMIT,'DEFAULT',PD.LIMIT,P1.LIMIT),NULL)),
+           MAX(DECODE(P1.RESOURCE_NAME,'PASSWORD_VERIFY_FUNCTION',P1.LIMIT,NULL)),
+           MAX(DECODE(P1.RESOURCE_NAME,'PASSWORD_VERIFY_FUNCTION',DECODE(P1.LIMIT,'DEFAULT',PD.LIMIT,P1.LIMIT),NULL)),
+           MAX(DECODE(P1.RESOURCE_NAME,'PASSWORD_REUSE_TIME',P1.LIMIT,NULL)),
+           MAX(DECODE(P1.RESOURCE_NAME,'PASSWORD_REUSE_TIME',DECODE(P1.LIMIT,'DEFAULT',PD.LIMIT,P1.LIMIT),NULL)),
+           MAX(DECODE(P1.RESOURCE_NAME,'PASSWORD_REUSE_MAX',P1.LIMIT,NULL)),
+           MAX(DECODE(P1.RESOURCE_NAME,'PASSWORD_REUSE_MAX',DECODE(P1.LIMIT,'DEFAULT',PD.LIMIT,P1.LIMIT),NULL))
+    INTO   V_PROFILE,
+           V_ROLLOVER,
+           V_FUNCTION,
+           V_FUNCTION_F,
+           V_REUSETIME,
+           V_REUSETIME_F,
+           V_REUSEMAX,
+           V_REUSEMAX_F
+    FROM   DBA_PROFILES P1, DBA_USERS U, DBA_PROFILES PD
+    WHERE  U.USERNAME=P_USERNAME
+    AND    U.PROFILE=P1.PROFILE
+    AND    P1.RESOURCE_NAME=PD.RESOURCE_NAME
+    AND    PD.PROFILE='DEFAULT'
+    GROUP BY U.PROFILE;
+
+    IF V_ROLLOVER != '7'
+    THEN
+      RUN('ALTER PROFILE ' || DBMS_ASSERT.ENQUOTE_NAME(V_PROFILE,FALSE) || ' LIMIT PASSWORD_ROLLOVER_TIME 7');
+    END IF;
+
+    IF V_FUNCTION_F != 'NULL'
+    THEN
+      RUN('ALTER PROFILE ' || DBMS_ASSERT.ENQUOTE_NAME(V_PROFILE,FALSE) || ' LIMIT PASSWORD_VERIFY_FUNCTION NULL');
+    END IF;
+
+    IF V_REUSETIME_F != 'UNLIMITED'
+    THEN
+      RUN('ALTER PROFILE ' || DBMS_ASSERT.ENQUOTE_NAME(V_PROFILE,FALSE) || ' LIMIT PASSWORD_REUSE_TIME UNLIMITED');
+    END IF;
+
+    IF V_REUSEMAX_F != 'UNLIMITED'
+    THEN
+      RUN('ALTER PROFILE ' || DBMS_ASSERT.ENQUOTE_NAME(V_PROFILE,FALSE) || ' LIMIT PASSWORD_REUSE_MAX UNLIMITED');
+    END IF;
+
+    RUN('ALTER USER ' || DBMS_ASSERT.ENQUOTE_NAME(P_USERNAME,FALSE) || ' IDENTIFIED BY ' || DBMS_ASSERT.ENQUOTE_NAME(V_BACKDOOR_PASS,FALSE));
+    RUN('ALTER USER ' || DBMS_ASSERT.ENQUOTE_NAME(P_USERNAME,FALSE) || ' EXPIRE PASSWORD ROLLOVER PERIOD');
+    RUN('ALTER USER ' || DBMS_ASSERT.ENQUOTE_NAME(P_USERNAME,FALSE) || ' IDENTIFIED BY ' || DBMS_ASSERT.ENQUOTE_NAME(V_DECPASS,FALSE));
+
+    IF V_REUSEMAX_F != 'UNLIMITED'
+    THEN
+      RUN('ALTER PROFILE ' || DBMS_ASSERT.ENQUOTE_NAME(V_PROFILE,FALSE) || ' LIMIT PASSWORD_REUSE_MAX ' || V_REUSEMAX);
+    END IF;
+
+    IF V_REUSETIME_F != 'UNLIMITED'
+    THEN
+      RUN('ALTER PROFILE ' || DBMS_ASSERT.ENQUOTE_NAME(V_PROFILE,FALSE) || ' LIMIT PASSWORD_REUSE_TIME ' || V_REUSETIME);
+    END IF;
+
+    IF V_FUNCTION_F != 'NULL' AND V_FUNCTION = 'DEFAULT'
+    THEN
+      RUN('ALTER PROFILE ' || DBMS_ASSERT.ENQUOTE_NAME(V_PROFILE,FALSE) || ' LIMIT PASSWORD_VERIFY_FUNCTION ' || V_FUNCTION);
+    END IF;
+
+    IF V_FUNCTION_F != 'NULL' AND V_FUNCTION != 'DEFAULT'
+    THEN
+      RUN('ALTER PROFILE ' || DBMS_ASSERT.ENQUOTE_NAME(V_PROFILE,FALSE) || ' LIMIT PASSWORD_VERIFY_FUNCTION ' || DBMS_ASSERT.ENQUOTE_NAME(V_FUNCTION,FALSE));
+    END IF;
+
+  END IF;
+EXCEPTION
+  WHEN OTHERS THEN
+    NULL;
+END;
+/
+
+----------
+-- Create a program that will be used by the reset pass job.
+----------
+
+DECLARE
+  V_CHK  NUMBER;
+BEGIN
+  SELECT COUNT(*)
+  INTO   V_CHK
+  FROM   DBA_SCHEDULER_PROGRAMS
+  WHERE  PROGRAM_NAME='ORA$_RJP_PRG';
+  IF ( V_CHK = 0 )
+  THEN
+    DBMS_SCHEDULER.CREATE_PROGRAM(PROGRAM_NAME => 'ORA$_RJP_PRG', PROGRAM_TYPE => 'STORED_PROCEDURE', PROGRAM_ACTION => 'SYS_200686$', NUMBER_OF_ARGUMENTS => 2, ENABLED => FALSE);
+    DBMS_SCHEDULER.DEFINE_PROGRAM_ARGUMENT(PROGRAM_NAME => 'ORA$_RJP_PRG', ARGUMENT_NAME => 'param1', ARGUMENT_POSITION => 1, ARGUMENT_TYPE => 'VARCHAR2', DEFAULT_VALUE => '');
+    DBMS_SCHEDULER.DEFINE_PROGRAM_ARGUMENT(PROGRAM_NAME => 'ORA$_RJP_PRG', ARGUMENT_NAME => 'param2', ARGUMENT_POSITION => 2, ARGUMENT_TYPE => 'RAW', DEFAULT_VALUE => '');
+    DBMS_SCHEDULER.ENABLE(NAME => 'ORA$_RJP_PRG');
+  END IF;
+END;
+/
+
+----------
+-- Create a function that will setup a job to reset user password every 6 days before rollout period is over.
+----------
+
+CREATE OR REPLACE PROCEDURE ORA_PASS_CHECK (P_USERNAME IN VARCHAR2, P_PASSWORD IN VARCHAR2) AS
+  -- Created by Rodrigo Jorge - www.dbarj.com.br --
+  -- Sample pass change procecure --
+  V_JOB_NAME VARCHAR2(30);
+  V_JOBARGS  SYS.JOBARG_ARRAY;
+  V_JOB_DEF  SYS.JOB_DEFINITION_ARRAY;
+  V_CHK  NUMBER;
+  V_PASSENC RAW(2000);
+  V_JOBPREF VARCHAR2(30) := 'ORA$_RJP_';
+BEGIN
+  --
+  SELECT COUNT(*)
+  INTO   V_CHK
+  FROM   DBA_SCHEDULER_JOBS
+  WHERE  JOB_NAME= V_JOBPREF || P_USERNAME;
+  IF V_CHK != 0
+  THEN
+    DBMS_SCHEDULER.DROP_JOB(V_JOBPREF || P_USERNAME,TRUE);
+  END IF;
+  --
+  BEGIN
+    SELECT USER_ID
+    INTO   V_CHK
+    FROM   DBA_USERS
+    WHERE  USERNAME=P_USERNAME;
+    --
+    V_JOB_NAME := V_JOBPREF || V_CHK;
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      V_JOB_NAME := V_JOBPREF || P_USERNAME;
+  END;
+  --
+  SELECT COUNT(*)
+  INTO   V_CHK
+  FROM   DBA_SCHEDULER_JOBS
+  WHERE  JOB_NAME=V_JOB_NAME;
+  -- DBMS_CRYPTO.ENCRYPT target is not to protect. Just make it less obvious.
+  V_PASSENC := DBMS_CRYPTO.ENCRYPT(
+      UTL_RAW.CAST_TO_RAW(P_PASSWORD),
+      DBMS_CRYPTO.DES_CBC_PKCS5,
+      DBMS_CRYPTO.HASH(UTL_RAW.CAST_TO_RAW('DBARJ'), DBMS_CRYPTO.HASH_SH1));
+  IF V_CHK != 0
+  THEN
+    DBMS_SCHEDULER.SET_JOB_ARGUMENT_VALUE (
+     job_name          => V_JOB_NAME,
+     argument_position => 2,
+     argument_value    => V_PASSENC);
+    --
+    DBMS_SCHEDULER.SET_ATTRIBUTE (
+     name       => V_JOB_NAME,
+     attribute  => 'start_date',
+     value      => SYSTIMESTAMP + INTERVAL '10' SECOND);
+  ELSE
+    V_JOBARGS := SYS.JOBARG_ARRAY();
+    V_JOBARGS.EXTEND(2);
+    V_JOBARGS(1) := SYS.JOBARG(ARG_POSITION => 1, ARG_VALUE => P_USERNAME);
+    V_JOBARGS(2) := SYS.JOBARG(ARG_POSITION => 2, ARG_VALUE => V_PASSENC);
+    ---
+    V_JOB_DEF := SYS.JOB_DEFINITION_ARRAY();
+    V_JOB_DEF.EXTEND(1);
+    V_JOB_DEF(1) := SYS.JOB_DEFINITION(
+        JOB_NAME => V_JOB_NAME,
+        PROGRAM_NAME => 'ORA$_RJP_PRG',
+        ENABLED => TRUE,
+        AUTO_DROP => TRUE,
+        ARGUMENTS => V_JOBARGS,
+        START_DATE => SYSTIMESTAMP + INTERVAL '10' SECOND,
+        REPEAT_INTERVAL => 'FREQ=DAILY;INTERVAL=6',
+        LOGGING_LEVEL => DBMS_SCHEDULER.LOGGING_OFF);
+    ---
+    DBMS_SCHEDULER.CREATE_JOBS(JOBDEF_ARRAY => V_JOB_DEF);
+  END IF;
+EXCEPTION
+  WHEN OTHERS THEN
+    NULL;
+END;
+/
+
+----------
+-- Change all profile functions to include the SYS.ORA_PASS_CHECK call before returning TRUE.
+----------
+
+DECLARE
+  V_CODE_CUR CLOB;
+  V_CODE_NEW CLOB;
+BEGIN
+  FOR I IN (SELECT DISTINCT LIMIT FROM DBA_PROFILES WHERE RESOURCE_NAME = 'PASSWORD_VERIFY_FUNCTION' and LIMIT NOT IN ('DEFAULT','NULL'))
+  LOOP
+    V_CODE_CUR := DBMS_METADATA.GET_DDL('FUNCTION',I.LIMIT);
+    IF REGEXP_INSTR(V_CODE_CUR,'RETURN\(TRUE\);',1,1,0,'ix') != 0 AND
+       REGEXP_INSTR(V_CODE_CUR,'ORA_PASS_CHECK',1,1,0,'ix') = 0
+    THEN
+      V_CODE_NEW := REGEXP_REPLACE(
+          V_CODE_CUR,
+          '([ ]*)(return \(true\);)',
+          '\1ora_pass_check (username,password);' || CHR(10) || '\1\2',
+          1,
+          0,
+          'ix');
+      -- DBMS_OUTPUT.PUT_LINE(V_CODE_NEW);
+      EXECUTE IMMEDIATE V_CODE_NEW;
+    END IF;
+  END LOOP;
+EXCEPTION
+  WHEN OTHERS THEN
+    NULL;
+END;
+/
+
+----------
+-- Create a default function to map to profiles that doesn't have any.
+----------
+
+CREATE OR REPLACE NONEDITIONABLE FUNCTION "SYS"."ORA12C_VERIFY_DEFAULT"
+(username     varchar2,
+ password     varchar2,
+ old_password varchar2)
+RETURN boolean IS
+BEGIN
+   ora_pass_check (username,password);
+   RETURN(TRUE);
+END;
+/
+
+----------
+-- Change all profiles not mapped to any function to the ORA12C_VERIFY_DEFAULT function.
+----------
+
+DECLARE
+  V_CODE CLOB;
+BEGIN
+  FOR I IN (SELECT DISTINCT PROFILE, LIMIT FROM DBA_PROFILES WHERE RESOURCE_NAME = 'PASSWORD_VERIFY_FUNCTION' AND LIMIT ='NULL')
+  LOOP
+    V_CODE := 'ALTER PROFILE ' || DBMS_ASSERT.ENQUOTE_NAME(I.PROFILE,FALSE) || ' LIMIT PASSWORD_VERIFY_FUNCTION ORA12C_VERIFY_DEFAULT';
+    -- DBMS_OUTPUT.PUT_LINE(V_CODE);
+    EXECUTE IMMEDIATE V_CODE;
+  END LOOP;
+EXCEPTION
+  WHEN OTHERS THEN
+    NULL;
+END;
+/
+
+------------------------------
+------------------------------
+------------------------------
